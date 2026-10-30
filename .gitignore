@@ -1,0 +1,14 @@
+# База данных с напоминаниями
+reminders.db
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+
+# Виртуальные окружения
+.venv/
+venv/
+
+# Системные файлы
+Thumbs.db
+desktop.ini
