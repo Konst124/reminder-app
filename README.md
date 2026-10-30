@@ -29,7 +29,7 @@
 ## Установка и запуск
 
 ```powershell
-git clone <URL-репозитория>
+git clone https://github.com/Konst124/reminder-app.git
 cd 4
 python -m pip install -r requirements.txt
 python app.py
