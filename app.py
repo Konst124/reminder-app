@@ -349,13 +349,6 @@ class AddReminderDialog(tk.Toplevel):
 
         self.title_entry.focus_set()
 
-    def _toggle_repeat(self):
-        state = "normal" if self.repeat_var.get() else "disabled"
-        self.repeat_every_spin.configure(state=state)
-        self.repeat_unit_box.configure(
-            state="readonly" if self.repeat_var.get() else "disabled"
-        )
-
         self.update_idletasks()
         x = master.winfo_rootx() + max(
             (master.winfo_width() - self.winfo_width()) // 2, 0
@@ -364,6 +357,13 @@ class AddReminderDialog(tk.Toplevel):
             (master.winfo_height() - self.winfo_height()) // 3, 0
         )
         self.geometry(f"+{x}+{y}")
+
+    def _toggle_repeat(self):
+        state = "normal" if self.repeat_var.get() else "disabled"
+        self.repeat_every_spin.configure(state=state)
+        self.repeat_unit_box.configure(
+            state="readonly" if self.repeat_var.get() else "disabled"
+        )
 
     def _save(self):
         title = self.title_var.get().strip()
