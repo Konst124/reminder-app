@@ -50,7 +50,7 @@ class ReminderPopup(tk.Toplevel):
 
     _offsets = itertools.cycle(range(0, 240, 40))
 
-    def __init__(self, master, reminder, on_done=None, on_snooze=None):
+    def __init__(self, master, reminder, on_done=None, on_snooze=None, repeat_note=None):
         super().__init__(master)
         self.reminder = reminder
         self.on_done = on_done
@@ -84,7 +84,14 @@ class ReminderPopup(tk.Toplevel):
             frame,
             text=f"Время срабатывания: {reminder['trigger_at']}",
             fg="#555555",
-        ).pack(anchor="w", pady=(6, 12))
+        ).pack(anchor="w", pady=(6, 2))
+
+        if repeat_note:
+            tk.Label(frame, text=repeat_note, fg="#555555").pack(
+                anchor="w", pady=(0, 12)
+            )
+        else:
+            tk.Label(frame, text="").pack(anchor="w", pady=(0, 12))
 
         buttons = tk.Frame(frame)
         buttons.pack(fill="x")

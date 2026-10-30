@@ -5,6 +5,7 @@
 смена статуса, выборка с фильтром, поиск сработавших.
 """
 
+import calendar
 import os
 import sqlite3
 from datetime import datetime, timedelta
@@ -18,12 +19,74 @@ STATUS_CANCELLED = "Отменено"
 
 ALL_STATUSES = (STATUS_PENDING, STATUS_DONE, STATUS_OVERDUE, STATUS_CANCELLED)
 
+REPEAT_UNITS = ("minutes", "hours", "days", "weeks", "months", "years")
+
+_REPEAT_SHORT = {
+    "minutes": "мин",
+    "hours": "ч",
+    "days": "дн",
+    "weeks": "нед",
+    "months": "мес",
+    "years": "г",
+}
+
 DATETIME_FORMAT = "%Y-%m-%d %H:%M"
 
 
 def now_str():
     """Текущая локальная дата/время в формате хранения."""
     return datetime.now().strftime(DATETIME_FORMAT)
+
+
+def format_repeat(repeat_every, repeat_unit):
+    """Короткое описание повтора для таблицы, например 'каждые 2 нед'."""
+    if repeat_every >= 1 and repeat_unit in REPEAT_UNITS:
+        return f"каждые {repeat_every} {_REPEAT_SHORT[repeat_unit]}"
+    return "—"
+
+
+def compute_next_occurrence(trigger_at, repeat_every, repeat_unit):
+    """Следующее срабатывание строго в будущем.
+
+    Пропущенные периоды (пока приложение было закрыто) схлопываются
+    в одно ближайшее будущее срабатывание. Для неповторяющихся
+    напоминаний возвращает None.
+    """
+    if repeat_every < 1 or repeat_unit not in REPEAT_UNITS:
+        return None
+    moment = datetime.strptime(trigger_at, DATETIME_FORMAT)
+    now = datetime.now()
+    if repeat_unit == "months":
+        while moment <= now:
+            moment = _add_months(moment, repeat_every)
+    elif repeat_unit == "years":
+        while moment <= now:
+            moment = _add_years(moment, repeat_every)
+    else:
+        steps = {
+            "minutes": timedelta(minutes=repeat_every),
+            "hours": timedelta(hours=repeat_every),
+            "days": timedelta(days=repeat_every),
+            "weeks": timedelta(weeks=repeat_every),
+        }
+        step = steps[repeat_unit]
+        while moment <= now:
+            moment += step
+    return moment.strftime(DATETIME_FORMAT)
+
+
+def _add_months(value, months):
+    index = value.month - 1 + months
+    year = value.year + index // 12
+    month = index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def _add_years(value, years):
+    year = value.year + years
+    day = min(value.day, calendar.monthrange(year, value.month)[1])
+    return value.replace(year=year, day=day)
 
 
 class ReminderDB:
@@ -45,16 +108,19 @@ class ReminderDB:
             conn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS reminders (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title       TEXT    NOT NULL,
-                    description TEXT    NOT NULL DEFAULT '',
-                    trigger_at  TEXT    NOT NULL,
-                    status      TEXT    NOT NULL DEFAULT '{STATUS_PENDING}',
-                    notified    INTEGER NOT NULL DEFAULT 0,
-                    created_at  TEXT    NOT NULL
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title        TEXT    NOT NULL,
+                    description  TEXT    NOT NULL DEFAULT '',
+                    trigger_at   TEXT    NOT NULL,
+                    status       TEXT    NOT NULL DEFAULT '{STATUS_PENDING}',
+                    notified     INTEGER NOT NULL DEFAULT 0,
+                    repeat_every INTEGER NOT NULL DEFAULT 0,
+                    repeat_unit  TEXT    NOT NULL DEFAULT 'none',
+                    created_at   TEXT    NOT NULL
                 )
                 """
             )
+            self._ensure_repeat_columns(conn)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders (status)"
             )
@@ -65,15 +131,35 @@ class ReminderDB:
         finally:
             conn.close()
 
-    def add_reminder(self, title, description, trigger_at):
-        """Создаёт напоминание в статусе 'Ожидает', возвращает его id."""
+    def _ensure_repeat_columns(self, conn):
+        """Миграция: добавляет колонки повтора в БД, созданную старой версией."""
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(reminders)")}
+        if "repeat_every" not in existing:
+            conn.execute(
+                "ALTER TABLE reminders ADD COLUMN repeat_every INTEGER NOT NULL DEFAULT 0"
+            )
+        if "repeat_unit" not in existing:
+            conn.execute(
+                "ALTER TABLE reminders ADD COLUMN repeat_unit TEXT NOT NULL DEFAULT 'none'"
+            )
+
+    def add_reminder(self, title, description, trigger_at, repeat_every=0, repeat_unit="none"):
+        """Создаёт напоминание в статусе 'Ожидает', возвращает его id.
+
+        repeat_every >= 1 и repeat_unit из REPEAT_UNITS задают повтор
+        (например, каждые 2 недели); repeat_every = 0 — без повтора.
+        """
+        if repeat_every >= 1 and repeat_unit not in REPEAT_UNITS:
+            raise ValueError(f"Неизвестная единица повтора: {repeat_unit}")
         conn = self._connect()
         try:
             cur = conn.execute(
                 "INSERT INTO reminders"
-                " (title, description, trigger_at, status, notified, created_at)"
-                " VALUES (?, ?, ?, ?, 0, ?)",
-                (title, description, trigger_at, STATUS_PENDING, now_str()),
+                " (title, description, trigger_at, status, notified,"
+                "  repeat_every, repeat_unit, created_at)"
+                " VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
+                (title, description, trigger_at, STATUS_PENDING,
+                 repeat_every, repeat_unit, now_str()),
             )
             conn.commit()
             return cur.lastrowid
@@ -154,6 +240,19 @@ class ReminderDB:
         try:
             conn.execute(
                 "UPDATE reminders SET notified = 1 WHERE id = ?", (reminder_id,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def reschedule_reminder(self, reminder_id, trigger_at):
+        """Переносит срабатывание на новое время и возвращает в 'Ожидает'."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE reminders SET trigger_at = ?, status = ?, notified = 0"
+                " WHERE id = ?",
+                (trigger_at, STATUS_PENDING, reminder_id),
             )
             conn.commit()
         finally:

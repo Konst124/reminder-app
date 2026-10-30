@@ -16,6 +16,8 @@ from db import (
     STATUS_OVERDUE,
     STATUS_PENDING,
     ReminderDB,
+    compute_next_occurrence,
+    format_repeat,
     now_str,
 )
 from notifications import ReminderPopup, show_toast
@@ -33,8 +35,8 @@ class ReminderApp:
         self._check_job = None
 
         self.root.title("Напоминалка")
-        self.root.geometry("860x500")
-        self.root.minsize(700, 380)
+        self.root.geometry("920x500")
+        self.root.minsize(760, 380)
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -86,7 +88,7 @@ class ReminderApp:
         container = ttk.Frame(self.root)
         container.pack(fill="both", expand=True, padx=8, pady=(0, 4))
 
-        columns = ("time", "title", "description", "status")
+        columns = ("time", "title", "description", "repeat", "status")
         self.tree = ttk.Treeview(
             container, columns=columns, show="headings", selectmode="browse"
         )
@@ -94,15 +96,23 @@ class ReminderApp:
             "time": "Время срабатывания",
             "title": "Заголовок",
             "description": "Описание",
+            "repeat": "Повтор",
             "status": "Статус",
         }
-        widths = {"time": 150, "title": 200, "description": 300, "status": 110}
+        widths = {
+            "time": 145,
+            "title": 180,
+            "description": 240,
+            "repeat": 105,
+            "status": 100,
+        }
         for column in columns:
             self.tree.heading(column, text=headers[column])
             self.tree.column(
                 column, width=widths[column], anchor="w", stretch=column == "description"
             )
         self.tree.column("time", anchor="center")
+        self.tree.column("repeat", anchor="center")
         self.tree.column("status", anchor="center")
 
         scrollbar = ttk.Scrollbar(
@@ -132,6 +142,7 @@ class ReminderApp:
                     row["trigger_at"],
                     row["title"],
                     row["description"],
+                    format_repeat(row["repeat_every"], row["repeat_unit"]),
                     row["status"],
                 ),
                 tags=(row["status"],),
@@ -186,7 +197,15 @@ class ReminderApp:
             if due:
                 for reminder in due:
                     self.db.mark_notified(reminder["id"])
-                    self.db.set_status(reminder["id"], STATUS_OVERDUE)
+                    next_time = compute_next_occurrence(
+                        reminder["trigger_at"],
+                        reminder["repeat_every"],
+                        reminder["repeat_unit"],
+                    )
+                    if next_time:
+                        self.db.reschedule_reminder(reminder["id"], next_time)
+                    else:
+                        self.db.set_status(reminder["id"], STATUS_OVERDUE)
                     self._show_notification(reminder)
                 self.refresh()
         finally:
@@ -198,11 +217,17 @@ class ReminderApp:
             f"Напоминание: {reminder['title']}",
             reminder["description"] or reminder["trigger_at"],
         )
+        repeat_note = None
+        if reminder["repeat_every"] >= 1:
+            repeat_note = "Повтор: " + format_repeat(
+                reminder["repeat_every"], reminder["repeat_unit"]
+            )
         popup = ReminderPopup(
             self.root,
             reminder,
             on_done=self._mark_done_from_popup,
             on_snooze=self._snooze_from_popup,
+            repeat_note=repeat_note,
         )
         self.popups[reminder["id"]] = popup
 
@@ -282,14 +307,54 @@ class AddReminderDialog(tk.Toplevel):
             row=5, column=1, sticky="w", pady=(0, 10)
         )
 
+        self.repeat_var = tk.BooleanVar(value=False)
+        self.repeat_every_var = tk.StringVar(value="1")
+        self.repeat_unit_var = tk.StringVar(value="дней")
+        self.repeat_unit_keys = {
+            "минут": "minutes",
+            "часов": "hours",
+            "дней": "days",
+            "недель": "weeks",
+            "месяцев": "months",
+            "лет": "years",
+        }
+
+        ttk.Checkbutton(
+            frame, text="Повторять:", variable=self.repeat_var,
+            command=self._toggle_repeat,
+        ).grid(row=6, column=0, sticky="w", pady=(0, 10))
+
+        repeat_frame = ttk.Frame(frame)
+        repeat_frame.grid(row=6, column=1, sticky="w", pady=(0, 10))
+        self.repeat_every_spin = ttk.Spinbox(
+            repeat_frame, from_=1, to=999, textvariable=self.repeat_every_var, width=5
+        )
+        self.repeat_every_spin.pack(side="left", padx=(0, 6))
+        self.repeat_unit_box = ttk.Combobox(
+            repeat_frame,
+            textvariable=self.repeat_unit_var,
+            state="readonly",
+            width=9,
+            values=list(self.repeat_unit_keys),
+        )
+        self.repeat_unit_box.pack(side="left")
+        self._toggle_repeat()
+
         buttons = ttk.Frame(frame)
-        buttons.grid(row=6, column=0, columnspan=2, sticky="e")
+        buttons.grid(row=7, column=0, columnspan=2, sticky="e")
         ttk.Button(buttons, text="Сохранить", command=self._save).pack(
             side="left", padx=(0, 8)
         )
         ttk.Button(buttons, text="Отмена", command=self.destroy).pack(side="left")
 
         self.title_entry.focus_set()
+
+    def _toggle_repeat(self):
+        state = "normal" if self.repeat_var.get() else "disabled"
+        self.repeat_every_spin.configure(state=state)
+        self.repeat_unit_box.configure(
+            state="readonly" if self.repeat_var.get() else "disabled"
+        )
 
         self.update_idletasks()
         x = master.winfo_rootx() + max(
@@ -328,10 +393,26 @@ class AddReminderDialog(tk.Toplevel):
             parent=self,
         ):
             return
+        repeat_every, repeat_unit = 0, "none"
+        if self.repeat_var.get():
+            try:
+                repeat_every = int(self.repeat_every_var.get())
+            except ValueError:
+                repeat_every = 0
+            if repeat_every < 1:
+                messagebox.showerror(
+                    "Ошибка",
+                    "Интервал повтора должен быть целым числом от 1.",
+                    parent=self,
+                )
+                return
+            repeat_unit = self.repeat_unit_keys[self.repeat_unit_var.get()]
         self.result = {
             "title": title,
             "description": description,
             "trigger_at": trigger_at.strftime(DATETIME_FORMAT),
+            "repeat_every": repeat_every,
+            "repeat_unit": repeat_unit,
         }
         self.destroy()
 
